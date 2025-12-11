@@ -463,124 +463,112 @@ wss.on('connection', (ws, req) => {
   }));
   
   // Handle incoming messages
- ws.on('message', (data) => {
+// Handle incoming messages - COMPLETE FIXED VERSION
+ws.on('message', (data, isBinary) => {
   const connData = activeConnections.get(ws);
   if (!connData) return;
   
-  console.log(`📨 RAW MESSAGE from ${connData.userId}:`, 
-    typeof data === 'string' ? data.substring(0, 100) : `[BINARY: ${data.length} bytes]`);
+  console.log(`📨 MESSAGE from ${connData.userId}:`, 
+    isBinary ? `[BINARY: ${data.length} bytes]` : `[TEXT: ${data.toString().substring(0, 100)}]`);
   
   try {
-    // Check if data is text (JSON) or binary
-    if (typeof data === 'string') {
-      console.log(`📨 Text message from ${connData.userId}:`, data.substring(0, 100));
-        
-        const message = JSON.parse(data);
-        
-        switch (message.type) {
-          case 'register':
-            console.log(`📝 User registered: ${message.userId || connData.userId}`);
-            if (message.userId && message.userId !== connData.userId) {
-              connData.userId = message.userId;
-            }
-            break;
-            
-          case 'start-recording':
-            console.log(`🎤 Starting recording for user: ${connData.userId}`);
-            connData.currentRecordingId = Date.now();
-            connData.audioBuffer = [];
-            
-            // Create metadata file
-            const metadata = {
-              userId: connData.userId,
-              recordingId: connData.currentRecordingId,
-              startTime: new Date().toISOString(),
-              sampleRate: message.sampleRate || 44100,
-              channels: message.channels || 1,
-              userName: message.userName || 'Anonymous'
-            };
-            
-            const metaFile = path.join(connData.userDir, `metadata-${connData.currentRecordingId}.json`);
-            fs.writeFileSync(metaFile, JSON.stringify(metadata, null, 2));
+    if (!isBinary) {
+      // TEXT message (JSON)
+      const message = JSON.parse(data.toString());
+      console.log(`📨 Text message type: ${message.type}`);
+      
+      switch (message.type) {
+        case 'register':
+          console.log(`📝 User registered: ${message.userId || connData.userId}`);
+          if (message.userId && message.userId !== connData.userId) {
+            connData.userId = message.userId;
+          }
+          break;
+          
+        case 'start-recording':
+          console.log(`🎤 STARTING recording for user: ${connData.userId}`);
+          connData.currentRecordingId = Date.now();
+          connData.audioBuffer = [];
+          
+          const metadata = {
+            userId: connData.userId,
+            recordingId: connData.currentRecordingId,
+            startTime: new Date().toISOString(),
+            sampleRate: message.sampleRate || 44100,
+            channels: message.channels || 1,
+            userName: message.userName || 'Anonymous'
+          };
+          
+          const metaFile = path.join(connData.userDir, `metadata-${connData.currentRecordingId}.json`);
+          fs.writeFileSync(metaFile, JSON.stringify(metadata, null, 2));
+          
+          ws.send(JSON.stringify({
+            type: 'recording-started',
+            recordingId: connData.currentRecordingId,
+            timestamp: new Date().toISOString()
+          }));
+          break;
+          
+        case 'stop-recording':
+          console.log(`⏹️ STOPPING recording for user: ${connData.userId}`);
+          if (connData.currentRecordingId) {
+            saveRecording(connData.userId, connData.currentRecordingId, connData.audioBuffer);
             
             ws.send(JSON.stringify({
-              type: 'recording-started',
+              type: 'recording-stopped',
               recordingId: connData.currentRecordingId,
               timestamp: new Date().toISOString()
             }));
-            break;
             
-          case 'stop-recording':
-            console.log(`⏹️ Stopping recording for user: ${connData.userId}`);
-            if (connData.currentRecordingId) {
-              saveRecording(connData.userId, connData.currentRecordingId, connData.audioBuffer);
-              
-              ws.send(JSON.stringify({
-                type: 'recording-stopped',
-                recordingId: connData.currentRecordingId,
-                timestamp: new Date().toISOString()
-              }));
-              
-              connData.currentRecordingId = null;
-              connData.audioBuffer = [];
-            }
-            break;
-            
-          case 'stop-streaming':
-            console.log(`🚫 User ${connData.userId} stopped streaming`);
-            if (connData.currentRecordingId && connData.audioBuffer.length > 0) {
-              saveRecording(connData.userId, connData.currentRecordingId, connData.audioBuffer);
-            }
             connData.currentRecordingId = null;
             connData.audioBuffer = [];
-            break;
-            
-          case 'ping':
-            // Keep-alive ping
-            ws.send(JSON.stringify({
-              type: 'pong',
-              timestamp: Date.now()
-            }));
-            break;
-        }
-      } else {
-        // Binary message (audio data)
-        if (connData.currentRecordingId) {
-          // Convert to Buffer
-          let buffer;
-          if (data instanceof ArrayBuffer) {
-            buffer = Buffer.from(data);
-          } else if (Buffer.isBuffer(data)) {
-            buffer = data;
-          } else if (data instanceof Uint8Array) {
-            buffer = Buffer.from(data);
-          } else {
-            console.error('❓ Unknown binary data type:', data.constructor.name);
-            return;
           }
+          break;
           
-          // Store audio chunk
-          connData.audioBuffer.push(buffer);
+        case 'stop-streaming':
+          console.log(`🚫 User ${connData.userId} stopped streaming`);
+          if (connData.currentRecordingId && connData.audioBuffer.length > 0) {
+            saveRecording(connData.userId, connData.currentRecordingId, connData.audioBuffer);
+          }
+          connData.currentRecordingId = null;
+          connData.audioBuffer = [];
+          break;
           
-          // Send acknowledgement (optional, can comment out to reduce traffic)
-          /*
+        case 'ping':
           ws.send(JSON.stringify({
-            type: 'chunk-received',
-            size: buffer.length,
+            type: 'pong',
             timestamp: Date.now()
           }));
-          */
-          
-          // Debug log every 10 chunks
-          if (connData.audioBuffer.length % 10 === 0) {
-            console.log(`📊 ${connData.userId}: Received ${connData.audioBuffer.length} chunks, total ${connData.audioBuffer.reduce((sum, buf) => sum + buf.length, 0)} bytes`);
-          }
-        }
+          break;
       }
-    } catch (error) {
-      console.error(`❌ Error processing message from ${connData.userId}:`, error);
+    } else {
+      // BINARY message (audio data)
+      if (connData.currentRecordingId) {
+        let buffer;
+        if (data instanceof ArrayBuffer) {
+          buffer = Buffer.from(data);
+        } else if (Buffer.isBuffer(data)) {
+          buffer = data;
+        } else if (data instanceof Uint8Array) {
+          buffer = Buffer.from(data);
+        } else {
+          console.error('❓ Unknown binary data type:', data.constructor.name);
+          return;
+        }
+        
+        connData.audioBuffer.push(buffer);
+        
+        if (connData.audioBuffer.length % 10 === 0) {
+          console.log(`📊 ${connData.userId}: ${connData.audioBuffer.length} chunks, ${connData.audioBuffer.reduce((sum, buf) => sum + buf.length, 0)} bytes`);
+        }
+      } else {
+        console.log(`⚠️ Audio data but no active recording for ${connData.userId}`);
+      }
     }
-  });
+  } catch (error) {
+    console.error(`❌ Error processing message from ${connData.userId}:`, error);
+  }
+});
   
   // Handle connection close
   ws.on('close', () => {
