@@ -9,7 +9,7 @@ const { v4: uuidv4 } = require('uuid');
 const app = express();
 
 app.use(cors({
-  origin: ['https://gff.lovable.app', 'http://localhost:3000', 'http://localhost:5173'],
+  origin: ['https://gff.lovable.app', 'https://preview--gff.lovable.app', 'http://localhost:3000', 'http://localhost:5173'],
   methods: ['GET', 'POST', 'OPTIONS'],
   credentials: true,
   allowedHeaders: ['Content-Type']
