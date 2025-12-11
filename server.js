@@ -463,14 +463,17 @@ wss.on('connection', (ws, req) => {
   }));
   
   // Handle incoming messages
-  ws.on('message', (data) => {
-    const connData = activeConnections.get(ws);
-    if (!connData) return;
-    
-    try {
-      // Check if data is text (JSON) or binary
-      if (typeof data === 'string') {
-        console.log(`📨 Text message from ${connData.userId}:`, data.substring(0, 100));
+ ws.on('message', (data) => {
+  const connData = activeConnections.get(ws);
+  if (!connData) return;
+  
+  console.log(`📨 RAW MESSAGE from ${connData.userId}:`, 
+    typeof data === 'string' ? data.substring(0, 100) : `[BINARY: ${data.length} bytes]`);
+  
+  try {
+    // Check if data is text (JSON) or binary
+    if (typeof data === 'string') {
+      console.log(`📨 Text message from ${connData.userId}:`, data.substring(0, 100));
         
         const message = JSON.parse(data);
         
