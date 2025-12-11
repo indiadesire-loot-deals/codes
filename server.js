@@ -1,4 +1,4 @@
-// server.js - PERFECT VERSION FOR YOUR CLIENT CODE
+// server.js - FIXED VERSION WITH DEBUGGING
 const express = require('express');
 const WebSocket = require('ws');
 const fs = require('fs');
@@ -9,12 +9,14 @@ const { v4: uuidv4 } = require('uuid');
 const app = express();
 
 app.use(cors({
-  origin: 'https://gff.lovable.app',
-  methods: ['GET', 'POST'],
-  credentials: true
+  origin: ['https://gff.lovable.app', 'http://localhost:3000', 'http://localhost:5173'],
+  methods: ['GET', 'POST', 'OPTIONS'],
+  credentials: true,
+  allowedHeaders: ['Content-Type']
 }));
 
 app.use(express.json({ limit: '50mb' }));
+app.use(express.raw({ type: 'audio/webm', limit: '50mb' }));
 
 // Get port from environment variable
 const PORT = process.env.PORT || 8080;
@@ -38,6 +40,93 @@ createDirectories();
 
 // Store active connections
 const activeConnections = new Map();
+
+// ========== DEBUG ENDPOINTS ==========
+
+// Debug endpoint to check storage
+app.get('/debug/storage', (req, res) => {
+  try {
+    const users = fs.existsSync(USER_RECORDINGS_DIR) 
+      ? fs.readdirSync(USER_RECORDINGS_DIR)
+      : [];
+    
+    const userStats = users.map(user => {
+      const userDir = path.join(USER_RECORDINGS_DIR, user);
+      const files = fs.readdirSync(userDir);
+      return {
+        userId: user,
+        fileCount: files.length,
+        files: files.slice(0, 10), // First 10 files
+        directory: userDir
+      };
+    });
+    
+    res.json({
+      storagePath: USER_RECORDINGS_DIR,
+      exists: fs.existsSync(USER_RECORDINGS_DIR),
+      totalUsers: users.length,
+      users: userStats,
+      diskInfo: {
+        AUDIO_DIR: AUDIO_DIR,
+        USER_RECORDINGS_DIR: USER_RECORDINGS_DIR
+      }
+    });
+  } catch (error) {
+    res.json({ 
+      error: error.message,
+      stack: error.stack,
+      storagePath: USER_RECORDINGS_DIR 
+    });
+  }
+});
+
+// Test endpoint to create a dummy file
+app.get('/test-save/:userId', (req, res) => {
+  const userId = req.params.userId;
+  const userDir = path.join(USER_RECORDINGS_DIR, userId);
+  
+  if (!fs.existsSync(userDir)) {
+    fs.mkdirSync(userDir, { recursive: true });
+    console.log(`Created directory: ${userDir}`);
+  }
+  
+  const recordingId = Date.now();
+  const testFile = path.join(userDir, `test-recording-${recordingId}.webm`);
+  
+  // Create a dummy audio file
+  const testData = Buffer.from('test audio data - ' + new Date().toISOString());
+  fs.writeFileSync(testFile, testData);
+  
+  console.log(`Test file created: ${testFile}`);
+  
+  res.json({
+    success: true,
+    message: `Test file created for ${userId}`,
+    file: testFile,
+    url: `/recordings/${userId}/test-recording-${recordingId}.webm`,
+    fullUrl: `${req.protocol}://${req.get('host')}/recordings/${userId}/test-recording-${recordingId}.webm`,
+    size: testData.length
+  });
+});
+
+// List all WebSocket connections
+app.get('/debug/connections', (req, res) => {
+  const connections = Array.from(activeConnections.entries()).map(([ws, data]) => ({
+    userId: data.userId,
+    connectedAt: data.connectedAt,
+    duration: Math.floor((Date.now() - data.connectedAt.getTime()) / 1000),
+    recordingId: data.currentRecordingId,
+    bufferSize: data.audioBuffer?.length || 0,
+    totalBufferBytes: data.audioBuffer?.reduce((sum, buf) => sum + buf.length, 0) || 0
+  }));
+  
+  res.json({ 
+    activeConnections: connections.length,
+    connections: connections 
+  });
+});
+
+// ========== MAIN ENDPOINTS ==========
 
 // HTTP endpoint to start recording
 app.post('/api/start-recording', (req, res) => {
@@ -65,6 +154,10 @@ app.post('/api/start-recording', (req, res) => {
 // HTTP endpoint to list recordings
 app.get('/api/recordings', (req, res) => {
   try {
+    if (!fs.existsSync(AUDIO_DIR)) {
+      return res.json({ recordings: [] });
+    }
+    
     const files = fs.readdirSync(AUDIO_DIR)
       .filter(file => file.endsWith('.webm') || file.endsWith('.mp3'))
       .map(file => {
@@ -88,11 +181,22 @@ app.get('/api/recordings', (req, res) => {
 // HTTP endpoint to get user recordings
 app.get('/api/recordings/:userId', (req, res) => {
   const { userId } = req.params;
-  const userDir = path.join(USER_RECORDINGS_DIR, userId);
   
   try {
+    // Clean userId - remove any trailing 'i' (from logs)
+    const cleanUserId = userId.endsWith('i') ? userId.slice(0, -1) : userId;
+    
+    const userDir = path.join(USER_RECORDINGS_DIR, cleanUserId);
+    
     if (!fs.existsSync(userDir)) {
-      return res.json({ recordings: [] });
+      console.log(`Directory does not exist: ${userDir}`);
+      return res.json({ 
+        userId: cleanUserId,
+        recordings: [],
+        count: 0,
+        directory: userDir,
+        exists: false
+      });
     }
     
     const files = fs.readdirSync(userDir)
@@ -104,18 +208,25 @@ app.get('/api/recordings/:userId', (req, res) => {
           filename: file,
           size: stats.size,
           created: stats.birthtime,
-          url: file.endsWith('.json') ? null : `/recordings/${userId}/${file}`
+          url: file.endsWith('.json') ? null : `/recordings/${cleanUserId}/${file}`,
+          fullUrl: `${req.protocol}://${req.get('host')}/recordings/${cleanUserId}/${file}`
         };
       });
     
     res.json({ 
-      userId,
+      userId: cleanUserId,
       recordings: files,
-      count: files.length
+      count: files.length,
+      directory: userDir,
+      exists: true
     });
   } catch (error) {
     console.error('Error getting user recordings:', error);
-    res.status(500).json({ error: 'Failed to get recordings' });
+    res.status(500).json({ 
+      error: 'Failed to get recordings',
+      message: error.message,
+      userId: req.params.userId
+    });
   }
 });
 
@@ -132,6 +243,12 @@ app.get('/health', (req, res) => {
       audioDir: AUDIO_DIR,
       userRecordingsDir: USER_RECORDINGS_DIR,
       exists: fs.existsSync(AUDIO_DIR)
+    },
+    endpoints: {
+      debugStorage: '/debug/storage',
+      debugConnections: '/debug/connections',
+      userRecordings: '/api/recordings/:userId',
+      testSave: '/test-save/:userId'
     }
   });
 });
@@ -148,14 +265,17 @@ app.get('/api/connections', (req, res) => {
 });
 
 // Endpoint to upload audio directly
-app.post('/api/upload-audio', express.raw({ type: 'audio/webm', limit: '50mb' }), (req, res) => {
+app.post('/api/upload-audio', (req, res) => {
   try {
     const { userId } = req.query;
     if (!userId) {
       return res.status(400).json({ error: 'User ID is required as query parameter' });
     }
     
-    const userDir = path.join(USER_RECORDINGS_DIR, userId);
+    // Clean userId
+    const cleanUserId = userId.endsWith('i') ? userId.slice(0, -1) : userId;
+    
+    const userDir = path.join(USER_RECORDINGS_DIR, cleanUserId);
     if (!fs.existsSync(userDir)) {
       fs.mkdirSync(userDir, { recursive: true });
     }
@@ -164,14 +284,15 @@ app.post('/api/upload-audio', express.raw({ type: 'audio/webm', limit: '50mb' })
     const filepath = path.join(userDir, filename);
     
     fs.writeFileSync(filepath, req.body);
-    console.log(`Audio uploaded for user ${userId}: ${filename} (${req.body.length} bytes)`);
+    console.log(`Audio uploaded for user ${cleanUserId}: ${filename} (${req.body.length} bytes)`);
     
     res.json({ 
       status: 'Upload successful', 
       filename,
-      userId,
+      userId: cleanUserId,
       filepath,
       size: req.body.length,
+      url: `/recordings/${cleanUserId}/${filename}`,
       timestamp: new Date().toISOString()
     });
   } catch (error) {
@@ -185,6 +306,11 @@ app.get('/', (req, res) => {
   res.json({
     service: 'Audio Streaming Server',
     version: '1.0.0',
+    debug: {
+      storage: '/debug/storage',
+      connections: '/debug/connections',
+      testSave: '/test-save/:userId'
+    },
     endpoints: {
       health: '/health',
       startRecording: 'POST /api/start-recording',
@@ -198,14 +324,17 @@ app.get('/', (req, res) => {
   });
 });
 
+// ========== WEBSOCKET SERVER ==========
+
 // Start HTTP server
 const server = app.listen(PORT, '0.0.0.0', () => {
-  console.log(`HTTP server running on port ${PORT}`);
-  console.log(`Audio files will be saved to: ${AUDIO_DIR}`);
-  console.log(`Health check: http://localhost:${PORT}/health`);
+  console.log(`✅ HTTP server running on port ${PORT}`);
+  console.log(`📁 Audio files will be saved to: ${AUDIO_DIR}`);
+  console.log(`🏥 Health check: http://localhost:${PORT}/health`);
+  console.log(`🔍 Debug storage: http://localhost:${PORT}/debug/storage`);
 });
 
-// Create WebSocket server with same HTTP server
+// Create WebSocket server
 const wss = new WebSocket.Server({ 
   server,
   perMessageDeflate: false,
@@ -215,23 +344,31 @@ const wss = new WebSocket.Server({
 // Function to save recording
 const saveRecording = (userId, recordingId, buffer) => {
   if (!recordingId || buffer.length === 0) {
-    console.log(`No audio data to save for recording ${recordingId}`);
+    console.log(`⚠️ No audio data to save for recording ${recordingId}`);
     return;
   }
   
-  const userDir = path.join(USER_RECORDINGS_DIR, userId);
+  // Clean userId
+  const cleanUserId = userId.endsWith('i') ? userId.slice(0, -1) : userId;
+  
+  const userDir = path.join(USER_RECORDINGS_DIR, cleanUserId);
   const webmFile = path.join(userDir, `recording-${recordingId}.webm`);
   
   try {
     // Combine all chunks
     const combinedBuffer = Buffer.concat(buffer);
     
+    console.log(`💾 Saving recording for ${cleanUserId}: ${webmFile} (${combinedBuffer.length} bytes)`);
+    
+    // Ensure directory exists
+    if (!fs.existsSync(userDir)) {
+      fs.mkdirSync(userDir, { recursive: true });
+      console.log(`📁 Created directory: ${userDir}`);
+    }
+    
     // Save WebM file
     fs.writeFileSync(webmFile, combinedBuffer);
-    console.log(`Audio saved for user ${userId}: ${webmFile} (${combinedBuffer.length} bytes)`);
-    
-    // Try to convert to MP3 if ffmpeg is available
-    convertToMP3(webmFile, recordingId, userId);
+    console.log(`✅ Audio saved for user ${cleanUserId}: ${webmFile} (${combinedBuffer.length} bytes)`);
     
     // Update metadata
     const metaFile = path.join(userDir, `metadata-${recordingId}.json`);
@@ -243,8 +380,11 @@ const saveRecording = (userId, recordingId, buffer) => {
       fs.writeFileSync(metaFile, JSON.stringify(metadata, null, 2));
     }
     
+    // Try to convert to MP3 if ffmpeg is available
+    convertToMP3(webmFile, recordingId, cleanUserId);
+    
   } catch (error) {
-    console.error(`Error saving recording ${recordingId} for user ${userId}:`, error);
+    console.error(`❌ Error saving recording ${recordingId} for user ${cleanUserId}:`, error);
   }
 };
 
@@ -255,7 +395,7 @@ const convertToMP3 = (inputFile, recordingId, userId) => {
   // Check if ffmpeg is available
   exec('which ffmpeg || where ffmpeg', (error) => {
     if (error) {
-      console.log('FFmpeg not available, skipping MP3 conversion');
+      console.log('🔇 FFmpeg not available, skipping MP3 conversion');
       return;
     }
     
@@ -264,9 +404,9 @@ const convertToMP3 = (inputFile, recordingId, userId) => {
     
     exec(`ffmpeg -i "${inputFile}" -codec:a libmp3lame -qscale:a 2 "${mp3File}"`, (ffmpegError) => {
       if (ffmpegError) {
-        console.error(`MP3 conversion failed for recording ${recordingId}:`, ffmpegError);
+        console.error(`❌ MP3 conversion failed for recording ${recordingId}:`, ffmpegError);
       } else {
-        console.log(`Converted to MP3: ${mp3File}`);
+        console.log(`✅ Converted to MP3: ${mp3File}`);
         
         // Update metadata
         const metaFile = path.join(userDir, `metadata-${recordingId}.json`);
@@ -282,22 +422,24 @@ const convertToMP3 = (inputFile, recordingId, userId) => {
 
 // WebSocket connection handler
 wss.on('connection', (ws, req) => {
-  console.log('New WebSocket connection from:', req.socket.remoteAddress);
+  const clientIp = req.socket.remoteAddress;
+  console.log(`🔌 New WebSocket connection from: ${clientIp}`);
   
   // Extract userId from query params
-  const url = new URL(req.url, `http://${req.headers.host}`);
-  let userId = url.searchParams.get('userId');
+  const urlParams = new URLSearchParams(req.url.split('?')[1]);
+  let userId = urlParams.get('userId');
   
   if (!userId) {
     userId = `anonymous_${uuidv4().substring(0, 8)}`;
   }
   
-  console.log(`User connected: ${userId}`);
+  console.log(`👤 User connected: ${userId}`);
   
   // Create user directory
   const userDir = path.join(USER_RECORDINGS_DIR, userId);
   if (!fs.existsSync(userDir)) {
     fs.mkdirSync(userDir, { recursive: true });
+    console.log(`📁 Created user directory: ${userDir}`);
   }
   
   // Store connection data
@@ -306,7 +448,8 @@ wss.on('connection', (ws, req) => {
     connectedAt: new Date(),
     currentRecordingId: null,
     audioBuffer: [],
-    userDir
+    userDir,
+    ws
   };
   
   activeConnections.set(ws, connectionData);
@@ -321,26 +464,26 @@ wss.on('connection', (ws, req) => {
   
   // Handle incoming messages
   ws.on('message', (data) => {
+    const connData = activeConnections.get(ws);
+    if (!connData) return;
+    
     try {
       // Check if data is text (JSON) or binary
       if (typeof data === 'string') {
-        // Text message (JSON)
-        const message = JSON.parse(data);
-        const connData = activeConnections.get(ws);
+        console.log(`📨 Text message from ${connData.userId}:`, data.substring(0, 100));
         
-        if (!connData) return;
+        const message = JSON.parse(data);
         
         switch (message.type) {
           case 'register':
-            console.log(`User registered: ${message.userId} (${message.userName || 'Anonymous'})`);
-            // Update userId if different
+            console.log(`📝 User registered: ${message.userId || connData.userId}`);
             if (message.userId && message.userId !== connData.userId) {
               connData.userId = message.userId;
             }
             break;
             
           case 'start-recording':
-            console.log(`Starting recording for user: ${message.userId || connData.userId}`);
+            console.log(`🎤 Starting recording for user: ${connData.userId}`);
             connData.currentRecordingId = Date.now();
             connData.audioBuffer = [];
             
@@ -365,7 +508,7 @@ wss.on('connection', (ws, req) => {
             break;
             
           case 'stop-recording':
-            console.log(`Stopping recording for user: ${connData.userId}`);
+            console.log(`⏹️ Stopping recording for user: ${connData.userId}`);
             if (connData.currentRecordingId) {
               saveRecording(connData.userId, connData.currentRecordingId, connData.audioBuffer);
               
@@ -381,20 +524,26 @@ wss.on('connection', (ws, req) => {
             break;
             
           case 'stop-streaming':
-            console.log(`User ${connData.userId} stopped streaming`);
+            console.log(`🚫 User ${connData.userId} stopped streaming`);
             if (connData.currentRecordingId && connData.audioBuffer.length > 0) {
               saveRecording(connData.userId, connData.currentRecordingId, connData.audioBuffer);
             }
             connData.currentRecordingId = null;
             connData.audioBuffer = [];
             break;
+            
+          case 'ping':
+            // Keep-alive ping
+            ws.send(JSON.stringify({
+              type: 'pong',
+              timestamp: Date.now()
+            }));
+            break;
         }
       } else {
         // Binary message (audio data)
-        const connData = activeConnections.get(ws);
-        
-        if (connData && connData.currentRecordingId) {
-          // Convert ArrayBuffer to Buffer
+        if (connData.currentRecordingId) {
+          // Convert to Buffer
           let buffer;
           if (data instanceof ArrayBuffer) {
             buffer = Buffer.from(data);
@@ -403,41 +552,42 @@ wss.on('connection', (ws, req) => {
           } else if (data instanceof Uint8Array) {
             buffer = Buffer.from(data);
           } else {
-            console.error('Unknown binary data type:', typeof data);
+            console.error('❓ Unknown binary data type:', data.constructor.name);
             return;
           }
           
           // Store audio chunk
           connData.audioBuffer.push(buffer);
           
-          // Send acknowledgement
+          // Send acknowledgement (optional, can comment out to reduce traffic)
+          /*
           ws.send(JSON.stringify({
             type: 'chunk-received',
             size: buffer.length,
             timestamp: Date.now()
           }));
+          */
+          
+          // Debug log every 10 chunks
+          if (connData.audioBuffer.length % 10 === 0) {
+            console.log(`📊 ${connData.userId}: Received ${connData.audioBuffer.length} chunks, total ${connData.audioBuffer.reduce((sum, buf) => sum + buf.length, 0)} bytes`);
+          }
         }
       }
     } catch (error) {
-      console.error('Error processing WebSocket message:', error);
-      
-      // Send error to client
-      ws.send(JSON.stringify({
-        type: 'error',
-        message: 'Failed to process message',
-        error: error.message
-      }));
+      console.error(`❌ Error processing message from ${connData.userId}:`, error);
     }
   });
   
   // Handle connection close
   ws.on('close', () => {
-    console.log(`User disconnected: ${userId}`);
+    console.log(`👋 User disconnected: ${userId}`);
     
     const connData = activeConnections.get(ws);
     if (connData) {
       // Save any pending recording
       if (connData.currentRecordingId && connData.audioBuffer.length > 0) {
+        console.log(`💾 Auto-saving recording on disconnect for ${connData.userId}`);
         saveRecording(connData.userId, connData.currentRecordingId, connData.audioBuffer);
       }
       
@@ -447,25 +597,16 @@ wss.on('connection', (ws, req) => {
   
   // Handle errors
   ws.on('error', (error) => {
-    console.error(`WebSocket error for user ${userId}:`, error);
+    console.error(`⚠️ WebSocket error for ${userId}:`, error);
     activeConnections.delete(ws);
   });
 });
 
-// Broadcast to all connections
-wss.broadcast = function(data) {
-  wss.clients.forEach(client => {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(data);
-    }
-  });
-};
-
-console.log(`WebSocket server listening on ws://localhost:${PORT}`);
+console.log(`🔌 WebSocket server listening on ws://localhost:${PORT}`);
 
 // Handle graceful shutdown
 process.on('SIGTERM', () => {
-  console.log('SIGTERM received, shutting down gracefully...');
+  console.log('🔄 SIGTERM received, shutting down gracefully...');
   
   // Close WebSocket connections
   wss.clients.forEach(client => {
@@ -474,7 +615,7 @@ process.on('SIGTERM', () => {
   
   // Close HTTP server
   server.close(() => {
-    console.log('Server closed');
+    console.log('👋 Server closed');
     process.exit(0);
   });
 });
