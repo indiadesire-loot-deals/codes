@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: audio-stream-server
+    env: node
+    region: oregon  # or your preferred region
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+    disk:
+      name: audio-storage
+      mountPath: /opt/render/project/src/server-recordings
+      sizeGB: 1
