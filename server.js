@@ -379,47 +379,10 @@ const saveRecording = (userId, recordingId, buffer) => {
       metadata.filePath = webmFile;
       fs.writeFileSync(metaFile, JSON.stringify(metadata, null, 2));
     }
-    
-    // Try to convert to MP3 if ffmpeg is available
-    convertToMP3(webmFile, recordingId, cleanUserId);
-    
-  } catch (error) {
+ } catch (error) {
     console.error(`❌ Error saving recording ${recordingId} for user ${cleanUserId}:`, error);
   }
 };
-
-// Function to convert WebM to MP3
-const convertToMP3 = (inputFile, recordingId, userId) => {
-  const { exec } = require('child_process');
-  
-  // Check if ffmpeg is available
-  exec('which ffmpeg || where ffmpeg', (error) => {
-    if (error) {
-      console.log('🔇 FFmpeg not available, skipping MP3 conversion');
-      return;
-    }
-    
-    const mp3File = inputFile.replace('.webm', '.mp3');
-    const userDir = path.join(USER_RECORDINGS_DIR, userId);
-    
-    exec(`ffmpeg -i "${inputFile}" -codec:a libmp3lame -qscale:a 2 "${mp3File}"`, (ffmpegError) => {
-      if (ffmpegError) {
-        console.error(`❌ MP3 conversion failed for recording ${recordingId}:`, ffmpegError);
-      } else {
-        console.log(`✅ Converted to MP3: ${mp3File}`);
-        
-        // Update metadata
-        const metaFile = path.join(userDir, `metadata-${recordingId}.json`);
-        if (fs.existsSync(metaFile)) {
-          const metadata = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
-          metadata.mp3File = mp3File;
-          fs.writeFileSync(metaFile, JSON.stringify(metadata, null, 2));
-        }
-      }
-    });
-  });
-};
-
 // WebSocket connection handler
 wss.on('connection', (ws, req) => {
   const clientIp = req.socket.remoteAddress;
