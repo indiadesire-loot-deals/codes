@@ -19,7 +19,7 @@ app.use(express.json({ limit: '50mb' }));
 app.use(express.raw({ type: 'audio/webm', limit: '50mb' }));
 
 // Get port from environment variable
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT || 10000;
 
 // Create directories for recordings
 const AUDIO_DIR = path.join(__dirname, 'server-recordings');
