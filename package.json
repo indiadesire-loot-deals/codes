@@ -12,7 +12,7 @@
     "ws": "^8.14.2",
     "cors": "^2.8.5",
     "uuid": "^9.0.1",
-    "replicate": "^0.28.0"  // ← ADD THIS LINE
+    "replicate": "^0.28.0" 
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
