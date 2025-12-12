@@ -129,7 +129,7 @@ from vosk import Model, KaldiRecognizer
 import os
 
 # Load model from current directory
-model_path = "vosk-model"
+model_path = "/vosk-model"
 if not os.path.exists(model_path):
     print(json.dumps({"error": "Vosk model not found at: " + model_path}))
     sys.exit(1)
@@ -190,7 +190,7 @@ print(json.dumps({
     
     // 5. Execute Python script
     console.log('🔤 Running Python Vosk transcription...');
-    const { stdout, stderr } = await execAsync(`python3 ${pythonScriptFile}`);
+    const { stdout, stderr } = await execAsync(`cd /usr/src/app && python3 ${pythonScriptFile}`);
     
     // 6. Clean up temporary files
     fs.unlinkSync(tempWebm);
