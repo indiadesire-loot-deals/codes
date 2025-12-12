@@ -3,10 +3,14 @@ const express = require('express');
 const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
+const Replicate = require("replicate");
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
 
 const app = express();
+const replicate = new Replicate({
+  auth: process.env.REPLICATE_API_TOKEN || "r8_I7SAJnqr9649BhIG0PWfHdFJZl51Kad3Istr3",
+});
 
 app.use(cors({
   origin: ['https://gff.lovable.app', 'https://preview--gff.lovable.app', 'http://localhost:3000', 'http://localhost:5173'],
@@ -383,6 +387,66 @@ const saveRecording = (userId, recordingId, buffer) => {
     console.error(`❌ Error saving recording ${recordingId} for user ${cleanUserId}:`, error);
   }
 };
+
+// ✅ ADD THIS FUNCTION HERE (AFTER saveRecording, BEFORE wss.on('connection'))
+async function transcribeWithReplicate(audioBuffer, userId, recordingId, clientWs) {
+  console.log(`🎤 Starting Replicate Whisper transcription for user: ${userId}`);
+
+  try {
+    // Convert audio buffer to base64 data URL
+    const audioBase64 = audioBuffer.toString('base64');
+    const dataUrl = `data:audio/webm;base64,${audioBase64}`;
+
+    const input = {
+      audio: dataUrl,
+      model: "base", // Can change to "small", "medium", "large" for better accuracy
+      transcription: "plain text",
+    };
+
+    console.log(`⏳ Sending ${audioBuffer.length} bytes audio to Replicate Whisper...`);
+    
+    // Run the Whisper model
+    const output = await replicate.run(
+      "openai/whisper:30414ee7c4fffc37e260fcab7842b5be470b9b840f2b608f5b2a8c6d6ba96e5c",
+      { input }
+    );
+
+    // Get the transcript from response
+    const transcript = output?.transcription || "";
+    console.log(`📝 Replicate Whisper Result: "${transcript.substring(0, 100)}..."`);
+
+    // Send the REAL transcript back to the client
+    if (clientWs.readyState === WebSocket.OPEN && transcript) {
+      clientWs.send(JSON.stringify({
+        type: 'transcript',
+        userId: userId,
+        recordingId: recordingId,
+        text: transcript.trim(),
+        timestamp: new Date().toISOString(),
+        engine: 'replicate-whisper'
+      }));
+      console.log(`✅ REAL transcript sent to user ${userId}`);
+    }
+
+    return transcript;
+
+  } catch (error) {
+    console.error('❌ Replicate Whisper transcription failed:', error.message);
+    
+    // Fallback: Send a generic message if STT fails
+    if (clientWs.readyState === WebSocket.OPEN) {
+      clientWs.send(JSON.stringify({
+        type: 'transcript',
+        userId: userId,
+        recordingId: recordingId,
+        text: "I spoke something but couldn't transcribe it properly.",
+        timestamp: new Date().toISOString(),
+        engine: 'fallback'
+      }));
+    }
+    return "";
+  }
+}
 // WebSocket connection handler
 wss.on('connection', (ws, req) => {
   const clientIp = req.socket.remoteAddress;
@@ -473,29 +537,35 @@ ws.on('message', (data, isBinary) => {
           break;
           
         case 'stop-recording':
-          console.log(`⏹️ STOPPING recording for user: ${connData.userId}`);
-          if (connData.currentRecordingId) {
-            saveRecording(connData.userId, connData.currentRecordingId, connData.audioBuffer);
-            
-            ws.send(JSON.stringify({
-              type: 'recording-stopped',
-              recordingId: connData.currentRecordingId,
-              timestamp: new Date().toISOString()
-            }));
-            
-            connData.currentRecordingId = null;
-            connData.audioBuffer = [];
-          }
-          break;
-          
-        case 'stop-streaming':
-          console.log(`🚫 User ${connData.userId} stopped streaming`);
-          if (connData.currentRecordingId && connData.audioBuffer.length > 0) {
-            saveRecording(connData.userId, connData.currentRecordingId, connData.audioBuffer);
-          }
-          connData.currentRecordingId = null;
-          connData.audioBuffer = [];
-          break;
+  console.log(`⏹️ STOPPING recording for user: ${connData.userId}`);
+  if (connData.currentRecordingId && connData.audioBuffer.length > 0) {
+    // Combine all audio chunks
+    const combinedBuffer = Buffer.concat(connData.audioBuffer);
+    
+    // Save recording
+    saveRecording(connData.userId, connData.currentRecordingId, connData.audioBuffer);
+    
+    // Send recording stopped confirmation
+    ws.send(JSON.stringify({
+      type: 'recording-stopped',
+      recordingId: connData.currentRecordingId,
+      timestamp: new Date().toISOString()
+    }));
+    
+    // 🎯 NEW: Send for REAL transcription with Replicate
+    transcribeWithReplicate(combinedBuffer, connData.userId, connData.currentRecordingId, ws)
+      .then(transcript => {
+        console.log(`✅ Replicate transcription completed for ${connData.userId}`);
+      })
+      .catch(err => {
+        console.error(`❌ Transcription failed: ${err.message}`);
+      });
+    
+    // Clear buffer
+    connData.currentRecordingId = null;
+    connData.audioBuffer = [];
+  }
+  break;
           
         case 'ping':
           ws.send(JSON.stringify({
