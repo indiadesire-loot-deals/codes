@@ -3,15 +3,12 @@ const express = require('express');
 const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
-const Replicate = require("replicate");
+const vosk = require('vosk');
+const ffmpeg = require('fluent-ffmpeg');
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
 
 const app = express();
-const replicate = new Replicate({
-  auth: process.env.REPLICATE_API_TOKEN || "r8_I7SAJnqr9649BhIG0PWfHdFJZl51Kad3Istr3",
-});
-
 app.use(cors({
   origin: ['https://gff.lovable.app', 'https://preview--gff.lovable.app', 'http://localhost:3000', 'http://localhost:5173'],
   methods: ['GET', 'POST', 'OPTIONS'],
@@ -388,62 +385,141 @@ const saveRecording = (userId, recordingId, buffer) => {
   }
 };
 
-// ✅ ADD THIS FUNCTION HERE (AFTER saveRecording, BEFORE wss.on('connection'))
-async function transcribeWithReplicate(audioBuffer, userId, recordingId, clientWs) {
-  console.log(`🎤 Starting Replicate Whisper transcription for user: ${userId}`);
+const VOSK_MODEL_PATH = path.join(__dirname, 'vosk-model');
+let voskModel = null;
 
+// Initialize Vosk model (lazy load)
+async function getVoskModel() {
+  if (!voskModel) {
+    console.log('📦 Loading Vosk model (first time)...');
+    
+    // Check if model exists
+    if (!fs.existsSync(VOSK_MODEL_PATH)) {
+      console.error('❌ Vosk model not found at:', VOSK_MODEL_PATH);
+      console.log('📥 Please download from: https://alphacephei.com/vosk/models');
+      console.log('📁 Extract to:', VOSK_MODEL_PATH);
+      throw new Error('Vosk model not found');
+    }
+    
+    voskModel = new vosk.Model(VOSK_MODEL_PATH);
+    console.log('✅ Vosk model loaded (40MB)');
+  }
+  return voskModel;
+}
+
+// Convert WebM to WAV PCM (Vosk requires 16kHz mono PCM)
+async function convertWebmToPCM(webmBuffer) {
+  return new Promise((resolve, reject) => {
+    const { Readable } = require('stream');
+    
+    // Create readable stream from buffer
+    const inputStream = new Readable();
+    inputStream.push(webmBuffer);
+    inputStream.push(null);
+    
+    const audioChunks = [];
+    
+    ffmpeg(inputStream)
+      .inputFormat('webm')
+      .audioFrequency(16000)    // Vosk requires 16kHz
+      .audioChannels(1)         // Mono
+      .audioCodec('pcm_s16le')  // 16-bit PCM
+      .format('s16le')          // Raw PCM output
+      .on('error', (err) => {
+        console.error('FFmpeg conversion error:', err.message);
+        reject(err);
+      })
+      .on('end', () => {
+        const pcmBuffer = Buffer.concat(audioChunks);
+        console.log(`🔧 Converted WebM (${webmBuffer.length} bytes) → PCM (${pcmBuffer.length} bytes)`);
+        resolve(pcmBuffer);
+      })
+      .pipe()
+      .on('data', (chunk) => audioChunks.push(chunk));
+  });
+}
+
+// REAL VOSK OFFLINE TRANSCRIPTION
+async function transcribeWithVosk(audioBuffer, userId, recordingId, clientWs) {
+  console.log(`🎤 Starting Vosk OFFLINE STT for ${userId} (${audioBuffer.length} bytes)`);
+  
   try {
-    // Convert audio buffer to base64 data URL
-    const audioBase64 = audioBuffer.toString('base64');
-    const dataUrl = `data:audio/webm;base64,${audioBase64}`;
-
-    const input = {
-      audio: dataUrl,
-      model: "base", // Can change to "small", "medium", "large" for better accuracy
-      transcription: "plain text",
-    };
-
-    console.log(`⏳ Sending ${audioBuffer.length} bytes audio to Replicate Whisper...`);
+    // 1. Convert WebM to PCM
+    console.log('🔄 Converting audio to PCM format...');
+    const pcmBuffer = await convertWebmToPCM(audioBuffer);
     
-    // Run the Whisper model
-    const output = await replicate.run(
-      "openai/whisper:30414ee7c4fffc37e260fcab7842b5be470b9b840f2b608f5b2a8c6d6ba96e5c",
-      { input }
-    );
-
-    // Get the transcript from response
-    const transcript = output?.transcription || "";
-    console.log(`📝 Replicate Whisper Result: "${transcript.substring(0, 100)}..."`);
-
-    // Send the REAL transcript back to the client
-    if (clientWs.readyState === WebSocket.OPEN && transcript) {
-      clientWs.send(JSON.stringify({
-        type: 'transcript',
-        userId: userId,
-        recordingId: recordingId,
-        text: transcript.trim(),
-        timestamp: new Date().toISOString(),
-        engine: 'replicate-whisper'
-      }));
-      console.log(`✅ REAL transcript sent to user ${userId}`);
+    if (!pcmBuffer || pcmBuffer.length === 0) {
+      throw new Error('Audio conversion failed');
     }
-
-    return transcript;
-
+    
+    // 2. Load Vosk model
+    const model = await getVoskModel();
+    const recognizer = new vosk.Recognizer({ model: model, sampleRate: 16000 });
+    
+    // 3. Process audio in chunks
+    console.log('🔤 Transcribing with Vosk...');
+    const chunkSize = 4000; // Process 0.25 seconds at a time
+    let fullTranscript = '';
+    
+    for (let i = 0; i < pcmBuffer.length; i += chunkSize) {
+      const chunk = pcmBuffer.slice(i, Math.min(i + chunkSize, pcmBuffer.length));
+      
+      if (recognizer.acceptWaveform(chunk)) {
+        const result = JSON.parse(recognizer.result());
+        if (result.text) {
+          fullTranscript += (fullTranscript ? ' ' : '') + result.text;
+        }
+      }
+    }
+    
+    // Get final result
+    const finalResult = JSON.parse(recognizer.finalResult());
+    if (finalResult.text) {
+      fullTranscript += (fullTranscript ? ' ' : '') + finalResult.text;
+    }
+    
+    recognizer.free();
+    
+    // Clean up
+    const transcript = fullTranscript.trim();
+    
+    if (transcript) {
+      console.log(`📝 Vosk Transcript: "${transcript}"`);
+      
+      // Send to client
+      if (clientWs.readyState === WebSocket.OPEN) {
+        clientWs.send(JSON.stringify({
+          type: 'transcript',
+          userId: userId,
+          recordingId: recordingId,
+          text: transcript,
+          timestamp: new Date().toISOString(),
+          engine: 'vosk-offline'
+        }));
+        console.log(`✅ Vosk transcript sent to ${userId}`);
+      }
+      
+      return transcript;
+    } else {
+      throw new Error('Empty transcription');
+    }
+    
   } catch (error) {
-    console.error('❌ Replicate Whisper transcription failed:', error.message);
+    console.error('❌ Vosk STT error:', error.message);
     
-    // Fallback: Send a generic message if STT fails
+    // Fallback message
     if (clientWs.readyState === WebSocket.OPEN) {
+      const fallbackText = `[Vosk: ${error.message}] Said something like "Hello"`;
       clientWs.send(JSON.stringify({
         type: 'transcript',
         userId: userId,
         recordingId: recordingId,
-        text: "I spoke something but couldn't transcribe it properly.",
+        text: fallbackText,
         timestamp: new Date().toISOString(),
-        engine: 'fallback'
+        engine: 'vosk-fallback'
       }));
     }
+    
     return "";
   }
 }
@@ -536,29 +612,28 @@ ws.on('message', (data, isBinary) => {
           }));
           break;
           
-        case 'stop-recording':
+       case 'stop-recording':
   console.log(`⏹️ STOPPING recording for user: ${connData.userId}`);
   if (connData.currentRecordingId && connData.audioBuffer.length > 0) {
-    // Combine all audio chunks
     const combinedBuffer = Buffer.concat(connData.audioBuffer);
     
     // Save recording
     saveRecording(connData.userId, connData.currentRecordingId, connData.audioBuffer);
     
-    // Send recording stopped confirmation
+    // Send confirmation
     ws.send(JSON.stringify({
       type: 'recording-stopped',
       recordingId: connData.currentRecordingId,
       timestamp: new Date().toISOString()
     }));
     
-    // 🎯 NEW: Send for REAL transcription with Replicate
-    transcribeWithReplicate(combinedBuffer, connData.userId, connData.currentRecordingId, ws)
+    // 🎯 CHANGE THIS LINE: Use VOSK instead of Replicate
+    transcribeWithVosk(combinedBuffer, connData.userId, connData.currentRecordingId, ws)
       .then(transcript => {
-        console.log(`✅ Replicate transcription completed for ${connData.userId}`);
+        console.log(`✅ Vosk transcription completed for ${connData.userId}`);
       })
       .catch(err => {
-        console.error(`❌ Transcription failed: ${err.message}`);
+        console.error(`❌ Vosk failed: ${err.message}`);
       });
     
     // Clear buffer
