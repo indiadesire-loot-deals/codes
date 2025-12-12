@@ -1,4 +1,4 @@
-// server.js - COMPLETE WORKING VERSION WITH VOSK STT
+// server.js - COMPLETE VERSION WITH PYTHON VOSK STT
 const express = require('express');
 const WebSocket = require('ws');
 const fs = require('fs');
@@ -6,7 +6,9 @@ const path = require('path');
 const ffmpeg = require('fluent-ffmpeg');
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
-const vosk = require('vosk');
+const { exec } = require('child_process');
+const { promisify } = require('util');
+const execAsync = promisify(exec);
 
 const app = express();
 app.use(cors({
@@ -34,7 +36,6 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'healthy', 
     timestamp: new Date().toISOString(),
-    hasVosk: !!voskModel,
     endpoints: ['/health', '/debug/storage', '/api/recordings/:userId']
   });
 });
@@ -94,102 +95,158 @@ app.get('/api/recordings/:userId', (req, res) => {
 
 app.use('/recordings', express.static(USER_RECORDINGS_DIR));
 
-// ========== VOSK SETUP ==========
-const MODEL_PATH = path.join(__dirname, 'vosk-model');
-let voskModel = null;
-
-// Download Vosk model if not present
-if (!fs.existsSync(MODEL_PATH)) {
-  console.log('⚠️ Vosk model not found. Using fallback transcription.');
-} else {
-  console.log('✅ Vosk model found at:', MODEL_PATH);
-}
-
-async function getVoskModel() {
-  if (!voskModel && fs.existsSync(MODEL_PATH)) {
-    console.log('📦 Loading Vosk model...');
-    voskModel = new vosk.Model(MODEL_PATH);
-    console.log('✅ Vosk model loaded');
-  }
-  return voskModel;
-}
-
-// SIMPLE TRANSCRIPTION FUNCTION (works without model too)
-async function transcribeAudio(audioBuffer, userId, recordingId, clientWs) {
-  console.log(`🎤 Attempting transcription for ${userId} (${audioBuffer.length} bytes)`);
+// ========== PYTHON VOSK TRANSCRIPTION ==========
+async function transcribeWithPythonVosk(audioBuffer, userId, recordingId, clientWs) {
+  console.log(`🎤 Starting Python Vosk transcription for ${userId} (${audioBuffer.length} bytes)`);
   
   try {
-    const model = await getVoskModel();
+    // 1. Save audio to temporary file
+    const tempWebm = `/tmp/audio-${recordingId}.webm`;
+    const tempWav = `/tmp/audio-${recordingId}.wav`;
     
-    if (!model) {
-      // Fallback: Simulate transcription
-      const fakeTranscript = `[Sample: User ${userId} said something like "Hello, this is a test recording"]`;
+    fs.writeFileSync(tempWebm, audioBuffer);
+    
+    // 2. Convert WebM to WAV using ffmpeg
+    console.log('🔄 Converting audio to WAV format...');
+    await new Promise((resolve, reject) => {
+      ffmpeg(tempWebm)
+        .audioFrequency(16000)
+        .audioChannels(1)
+        .format('wav')
+        .save(tempWav)
+        .on('end', resolve)
+        .on('error', reject);
+    });
+    
+    console.log(`✅ Audio converted: ${fs.statSync(tempWav).size} bytes`);
+    
+    // 3. Create Python script for Vosk transcription
+    const pythonScript = `
+import sys
+import json
+import wave
+from vosk import Model, KaldiRecognizer
+import os
+
+# Load model from current directory
+model_path = "vosk-model"
+if not os.path.exists(model_path):
+    print(json.dumps({"error": "Vosk model not found at: " + model_path}))
+    sys.exit(1)
+
+model = Model(model_path)
+
+# Read WAV file
+try:
+    wf = wave.open('${tempWav}', 'rb')
+except Exception as e:
+    print(json.dumps({"error": f"Cannot open audio file: {str(e)}"}))
+    sys.exit(1)
+
+# Check audio format
+if wf.getnchannels() != 1:
+    print(json.dumps({"error": "Audio file must be mono (1 channel)"}))
+    sys.exit(1)
+
+if wf.getsampwidth() != 2:
+    print(json.dumps({"error": "Audio file must be 16-bit PCM"}))
+    sys.exit(1)
+
+if wf.getframerate() not in [8000, 16000, 32000, 48000]:
+    print(json.dumps({"error": f"Unsupported sample rate: {wf.getframerate()}"}))
+    sys.exit(1)
+
+# Create recognizer
+rec = KaldiRecognizer(model, wf.getframerate())
+rec.SetWords(True)
+
+# Process audio
+full_text = ""
+while True:
+    data = wf.readframes(4000)
+    if len(data) == 0:
+        break
+    if rec.AcceptWaveform(data):
+        result = json.loads(rec.Result())
+        if 'text' in result and result['text']:
+            full_text += " " + result['text']
+
+# Get final result
+final_result = json.loads(rec.FinalResult())
+if 'text' in final_result and final_result['text']:
+    full_text += " " + final_result['text']
+
+# Return result
+print(json.dumps({
+    "text": full_text.strip(),
+    "success": True,
+    "model": "vosk-model-small-en-us-0.15"
+}))
+`;
+    
+    // 4. Save Python script to temporary file
+    const pythonScriptFile = `/tmp/vosk-transcribe-${recordingId}.py`;
+    fs.writeFileSync(pythonScriptFile, pythonScript);
+    
+    // 5. Execute Python script
+    console.log('🔤 Running Python Vosk transcription...');
+    const { stdout, stderr } = await execAsync(`python3 ${pythonScriptFile}`);
+    
+    // 6. Clean up temporary files
+    fs.unlinkSync(tempWebm);
+    fs.unlinkSync(tempWav);
+    fs.unlinkSync(pythonScriptFile);
+    
+    // 7. Parse result
+    const result = JSON.parse(stdout);
+    
+    if (result.error) {
+      throw new Error(result.error);
+    }
+    
+    const transcript = result.text || "[No speech detected]";
+    
+    if (transcript) {
+      console.log(`📝 Python Vosk Transcript: "${transcript}"`);
       
+      // Send to client
       if (clientWs.readyState === WebSocket.OPEN) {
         clientWs.send(JSON.stringify({
           type: 'transcript',
           userId: userId,
           recordingId: recordingId,
-          text: fakeTranscript,
+          text: transcript,
           timestamp: new Date().toISOString(),
-          engine: 'fallback'
+          engine: 'python-vosk'
         }));
+        console.log(`✅ Transcript sent to ${userId}`);
       }
-      return fakeTranscript;
+      
+      return transcript;
+    } else {
+      throw new Error('Empty transcription received');
     }
     
-    // Real Vosk transcription
-    const tempFile = path.join(__dirname, `temp-${recordingId}.webm`);
-    fs.writeFileSync(tempFile, audioBuffer);
-    
-    return new Promise((resolve) => {
-      ffmpeg(tempFile)
-        .audioFrequency(16000)
-        .audioChannels(1)
-        .format('s16le')
-        .on('end', async () => {
-          // Read the converted audio
-          const pcmBuffer = fs.readFileSync(tempFile.replace('.webm', '.raw'));
-          
-          const recognizer = new vosk.Recognizer({ model: model, sampleRate: 16000 });
-          recognizer.acceptWaveform(pcmBuffer);
-          
-          const result = JSON.parse(recognizer.finalResult());
-          const transcript = result.text || "[No speech detected]";
-          
-          recognizer.free();
-          
-          // Clean up
-          fs.unlinkSync(tempFile);
-          fs.unlinkSync(tempFile.replace('.webm', '.raw'));
-          
-          console.log(`📝 Transcript: "${transcript}"`);
-          
-          if (clientWs.readyState === WebSocket.OPEN) {
-            clientWs.send(JSON.stringify({
-              type: 'transcript',
-              userId: userId,
-              recordingId: recordingId,
-              text: transcript,
-              timestamp: new Date().toISOString(),
-              engine: 'vosk'
-            }));
-          }
-          
-          resolve(transcript);
-        })
-        .on('error', (err) => {
-          console.error('FFmpeg error:', err);
-          resolve(`[Transcription error: ${err.message}]`);
-        })
-        .save(tempFile.replace('.webm', '.raw'));
-    });
-    
   } catch (error) {
-    console.error('❌ Transcription error:', error.message);
+    console.error('❌ Python Vosk transcription error:', error.message);
     
-    const errorText = `[Transcription failed: ${error.message}]`;
+    // Clean up any remaining temp files
+    try {
+      const tempFiles = [
+        `/tmp/audio-${recordingId}.webm`,
+        `/tmp/audio-${recordingId}.wav`,
+        `/tmp/vosk-transcribe-${recordingId}.py`
+      ];
+      tempFiles.forEach(file => {
+        if (fs.existsSync(file)) fs.unlinkSync(file);
+      });
+    } catch (e) {
+      // Ignore cleanup errors
+    }
+    
+    // Send error to client
     if (clientWs.readyState === WebSocket.OPEN) {
+      const errorText = `[Transcription Error: ${error.message}]`;
       clientWs.send(JSON.stringify({
         type: 'transcript',
         userId: userId,
@@ -200,7 +257,7 @@ async function transcribeAudio(audioBuffer, userId, recordingId, clientWs) {
       }));
     }
     
-    return errorText;
+    return `[Transcription failed: ${error.message}]`;
   }
 }
 
@@ -209,13 +266,14 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ HTTP server running on port ${PORT}`);
   console.log(`📁 Audio files saved to: ${AUDIO_DIR}`);
   console.log(`🏥 Health check: http://localhost:${PORT}/health`);
+  console.log(`🔤 Using Python Vosk for transcription`);
 });
 
 const wss = new WebSocket.Server({ server, perMessageDeflate: false });
 
 // Function to save recording
 const saveRecording = (userId, recordingId, buffer) => {
-  if (!recordingId || buffer.length === 0) return;
+  if (!recordingId || buffer.length === 0) return null;
   
   const cleanUserId = userId.endsWith('i') ? userId.slice(0, -1) : userId;
   const userDir = path.join(USER_RECORDINGS_DIR, cleanUserId);
@@ -269,7 +327,7 @@ wss.on('connection', (ws, req) => {
     type: 'connected',
     userId,
     timestamp: new Date().toISOString(),
-    message: 'Connected to audio streaming server with STT'
+    message: 'Connected to audio streaming server with Python Vosk STT'
   }));
   
   ws.on('message', async (data, isBinary) => {
@@ -306,18 +364,18 @@ wss.on('connection', (ws, req) => {
                 type: 'recording-stopped',
                 recordingId: connData.currentRecordingId,
                 timestamp: new Date().toISOString(),
-                message: 'Audio saved. Transcribing...'
+                message: 'Audio saved. Transcribing with Python Vosk...'
               }));
               
-              // Transcribe (async - don't wait)
+              // Transcribe with Python Vosk (async)
               if (audioBuffer) {
-                transcribeAudio(
+                transcribeWithPythonVosk(
                   audioBuffer, 
                   connData.userId, 
                   connData.currentRecordingId, 
                   ws
                 ).then(transcript => {
-                  console.log(`✅ Transcription completed for ${connData.userId}`);
+                  console.log(`✅ Python Vosk transcription completed for ${connData.userId}`);
                 }).catch(err => {
                   console.error(`❌ Transcription failed:`, err);
                 });
