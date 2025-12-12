@@ -3,10 +3,12 @@ const express = require('express');
 const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
-const vosk = require('vosk');
 const ffmpeg = require('fluent-ffmpeg');
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
+const { exec } = require('child_process');
+const { promisify } = require('util');
+const execAsync = promisify(exec);
 
 const app = express();
 app.use(cors({
@@ -385,103 +387,117 @@ const saveRecording = (userId, recordingId, buffer) => {
   }
 };
 
-const VOSK_MODEL_PATH = path.join(__dirname, 'vosk-model');
-let voskModel = null;
-
-// Initialize Vosk model (lazy load)
-async function getVoskModel() {
-  if (!voskModel) {
-    console.log('📦 Loading Vosk model (first time)...');
-    
-    // Check if model exists
-    if (!fs.existsSync(VOSK_MODEL_PATH)) {
-      console.error('❌ Vosk model not found at:', VOSK_MODEL_PATH);
-      console.log('📥 Please download from: https://alphacephei.com/vosk/models');
-      console.log('📁 Extract to:', VOSK_MODEL_PATH);
-      throw new Error('Vosk model not found');
-    }
-    
-    voskModel = new vosk.Model(VOSK_MODEL_PATH);
-    console.log('✅ Vosk model loaded (40MB)');
-  }
-  return voskModel;
-}
-
-// Convert WebM to WAV PCM (Vosk requires 16kHz mono PCM)
-async function convertWebmToPCM(webmBuffer) {
-  return new Promise((resolve, reject) => {
-    const { Readable } = require('stream');
-    
-    // Create readable stream from buffer
-    const inputStream = new Readable();
-    inputStream.push(webmBuffer);
-    inputStream.push(null);
-    
-    const audioChunks = [];
-    
-    ffmpeg(inputStream)
-      .inputFormat('webm')
-      .audioFrequency(16000)    // Vosk requires 16kHz
-      .audioChannels(1)         // Mono
-      .audioCodec('pcm_s16le')  // 16-bit PCM
-      .format('s16le')          // Raw PCM output
-      .on('error', (err) => {
-        console.error('FFmpeg conversion error:', err.message);
-        reject(err);
-      })
-      .on('end', () => {
-        const pcmBuffer = Buffer.concat(audioChunks);
-        console.log(`🔧 Converted WebM (${webmBuffer.length} bytes) → PCM (${pcmBuffer.length} bytes)`);
-        resolve(pcmBuffer);
-      })
-      .pipe()
-      .on('data', (chunk) => audioChunks.push(chunk));
-  });
-}
-
-// REAL VOSK OFFLINE TRANSCRIPTION
+// Python-based Vosk transcription
 async function transcribeWithVosk(audioBuffer, userId, recordingId, clientWs) {
-  console.log(`🎤 Starting Vosk OFFLINE STT for ${userId} (${audioBuffer.length} bytes)`);
+  console.log(`🎤 Starting Python Vosk STT for ${userId} (${audioBuffer.length} bytes)`);
   
   try {
-    // 1. Convert WebM to PCM
-    console.log('🔄 Converting audio to PCM format...');
-    const pcmBuffer = await convertWebmToPCM(audioBuffer);
+    // 1. Save audio to temporary file
+    const tempWebm = `/tmp/temp-${recordingId}.webm`;
+    const tempWav = `/tmp/temp-${recordingId}.wav`;
     
-    if (!pcmBuffer || pcmBuffer.length === 0) {
-      throw new Error('Audio conversion failed');
+    fs.writeFileSync(tempWebm, audioBuffer);
+    
+    // 2. Convert WebM to WAV using ffmpeg
+    console.log('🔄 Converting audio to WAV format...');
+    await new Promise((resolve, reject) => {
+      ffmpeg(tempWebm)
+        .audioFrequency(16000)
+        .audioChannels(1)
+        .format('wav')
+        .save(tempWav)
+        .on('end', resolve)
+        .on('error', (err) => {
+          console.error('FFmpeg conversion error:', err.message);
+          reject(err);
+        });
+    });
+    
+    console.log(`✅ Audio converted: ${fs.statSync(tempWav).size} bytes`);
+    
+    // 3. Run Python vosk transcription script
+    console.log('🔤 Transcribing with Python Vosk...');
+    
+    // Create a Python script as a string
+    const pythonScript = `
+import sys
+import json
+import wave
+from vosk import Model, KaldiRecognizer
+
+# Load model from current directory
+model = Model('vosk-model')
+
+# Read WAV file
+try:
+    wf = wave.open('${tempWav}', 'rb')
+except Exception as e:
+    print(json.dumps({'error': f'Cannot open audio file: {str(e)}'}))
+    sys.exit(1)
+
+# Check audio format
+if wf.getnchannels() != 1:
+    print(json.dumps({'error': 'Audio file must be mono (1 channel)'}))
+    sys.exit(1)
+
+if wf.getsampwidth() != 2:
+    print(json.dumps({'error': 'Audio file must be 16-bit PCM'}))
+    sys.exit(1)
+
+if wf.getframerate() not in [8000, 16000, 32000, 48000]:
+    print(json.dumps({'error': f'Unsupported sample rate: {wf.getframerate()}'}))
+    sys.exit(1)
+
+# Create recognizer
+rec = KaldiRecognizer(model, wf.getframerate())
+rec.SetWords(True)
+
+# Process audio
+transcript_parts = []
+while True:
+    data = wf.readframes(4000)
+    if len(data) == 0:
+        break
+    if rec.AcceptWaveform(data):
+        result = json.loads(rec.Result())
+        if 'text' in result and result['text']:
+            transcript_parts.append(result['text'])
+
+# Get final result
+final_result = json.loads(rec.FinalResult())
+if 'text' in final_result and final_result['text']:
+    transcript_parts.append(final_result['text'])
+
+# Combine all parts
+full_transcript = ' '.join(transcript_parts).strip()
+
+# Return result
+print(json.dumps({
+    'text': full_transcript,
+    'model': 'vosk-model-small-en-us-0.15'
+}))
+`;
+    
+    // Save Python script to temp file
+    const pythonScriptFile = `/tmp/vosk-script-${recordingId}.py`;
+    fs.writeFileSync(pythonScriptFile, pythonScript);
+    
+    // Execute Python script
+    const { stdout, stderr } = await execAsync(`cd ${__dirname} && python3 ${pythonScriptFile}`);
+    
+    // Clean up temp files
+    fs.unlinkSync(tempWebm);
+    fs.unlinkSync(tempWav);
+    fs.unlinkSync(pythonScriptFile);
+    
+    // Parse result
+    const result = JSON.parse(stdout);
+    
+    if (result.error) {
+      throw new Error(result.error);
     }
     
-    // 2. Load Vosk model
-    const model = await getVoskModel();
-    const recognizer = new vosk.Recognizer({ model: model, sampleRate: 16000 });
-    
-    // 3. Process audio in chunks
-    console.log('🔤 Transcribing with Vosk...');
-    const chunkSize = 4000; // Process 0.25 seconds at a time
-    let fullTranscript = '';
-    
-    for (let i = 0; i < pcmBuffer.length; i += chunkSize) {
-      const chunk = pcmBuffer.slice(i, Math.min(i + chunkSize, pcmBuffer.length));
-      
-      if (recognizer.acceptWaveform(chunk)) {
-        const result = JSON.parse(recognizer.result());
-        if (result.text) {
-          fullTranscript += (fullTranscript ? ' ' : '') + result.text;
-        }
-      }
-    }
-    
-    // Get final result
-    const finalResult = JSON.parse(recognizer.finalResult());
-    if (finalResult.text) {
-      fullTranscript += (fullTranscript ? ' ' : '') + finalResult.text;
-    }
-    
-    recognizer.free();
-    
-    // Clean up
-    const transcript = fullTranscript.trim();
+    const transcript = result.text.trim();
     
     if (transcript) {
       console.log(`📝 Vosk Transcript: "${transcript}"`);
@@ -501,11 +517,26 @@ async function transcribeWithVosk(audioBuffer, userId, recordingId, clientWs) {
       
       return transcript;
     } else {
+      console.log('⚠️ Empty transcription received');
       throw new Error('Empty transcription');
     }
     
   } catch (error) {
     console.error('❌ Vosk STT error:', error.message);
+    
+    // Try to clean up temp files if they exist
+    try {
+      const tempFiles = [
+        `/tmp/temp-${recordingId}.webm`,
+        `/tmp/temp-${recordingId}.wav`,
+        `/tmp/vosk-script-${recordingId}.py`
+      ];
+      tempFiles.forEach(file => {
+        if (fs.existsSync(file)) fs.unlinkSync(file);
+      });
+    } catch (e) {
+      // Ignore cleanup errors
+    }
     
     // Fallback message
     if (clientWs.readyState === WebSocket.OPEN) {
