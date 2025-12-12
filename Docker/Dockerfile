@@ -1,19 +1,21 @@
-# Use an official Node.js LTS version as the base image
+# Dockerfile - WITH VIRTUAL ENVIRONMENT
 FROM node:18-bookworm-slim
 
-# 1. Install system dependencies (Python, pip, ffmpeg, and Vosk model tools)
+# 1. Install system dependencies
 RUN apt-get update && apt-get install -y \
     python3 \
     python3-pip \
+    python3-venv \
     ffmpeg \
     curl \
     unzip \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. Install Python Vosk (no compilation needed)
-RUN pip3 install vosk
+# 2. Create and activate virtual environment, install Vosk
+RUN python3 -m venv /opt/venv \
+    && /opt/venv/bin/pip install vosk
 
-# 3. Download and extract the Vosk model
+# 3. Download Vosk model
 RUN curl -L https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip -o vosk-model.zip \
     && unzip -q vosk-model.zip \
     && mv vosk-model-small-en-us-0.15 vosk-model \
@@ -21,18 +23,13 @@ RUN curl -L https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip 
 
 # 4. Set up Node.js app
 WORKDIR /usr/src/app
-
-# Copy package files first for better caching
 COPY package*.json ./
-
-# 5. Install Node.js dependencies
 RUN npm install --production
-
-# Copy the rest of your app
 COPY . .
 
-# Expose your port
-EXPOSE 10000
+# 5. Make Python Vosk available system-wide
+ENV PATH="/opt/venv/bin:$PATH"
+ENV VIRTUAL_ENV="/opt/venv"
 
-# Start command
-CMD [ "node", "server.js" ]
+EXPOSE 10000
+CMD ["node", "server.js"]
