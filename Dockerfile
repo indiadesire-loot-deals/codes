@@ -1,6 +1,7 @@
+# Use an official Node.js LTS version as the base image
 FROM node:18-bookworm-slim
 
-# 1. Install Python, pip, ffmpeg, and basic tools
+# 1. Install system dependencies (Python, pip, ffmpeg, and Vosk model tools)
 RUN apt-get update && apt-get install -y \
     python3 \
     python3-pip \
@@ -12,7 +13,7 @@ RUN apt-get update && apt-get install -y \
 # 2. Install Python Vosk (no compilation needed)
 RUN pip3 install vosk
 
-# 3. Download the Vosk model
+# 3. Download and extract the Vosk model
 RUN curl -L https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip -o vosk-model.zip \
     && unzip -q vosk-model.zip \
     && mv vosk-model-small-en-us-0.15 vosk-model \
@@ -24,7 +25,7 @@ WORKDIR /usr/src/app
 # Copy package files first for better caching
 COPY package*.json ./
 
-# 5. Install Node.js dependencies (EXCLUDING 'vosk')
+# 5. Install Node.js dependencies
 RUN npm install --production
 
 # Copy the rest of your app
