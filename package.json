@@ -5,7 +5,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "nodemon server.js"
+    "dev": "nodemon server.js",
+    "build": "curl -L https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip -o vosk-model.zip && unzip -q vosk-model.zip && mv vosk-model-small-en-us-0.15 vosk-model && rm vosk-model.zip && npm install"
   },
   "dependencies": {
     "express": "^4.18.2",
