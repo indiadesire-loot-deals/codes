@@ -1,4 +1,4 @@
-# Dockerfile - WITH VIRTUAL ENVIRONMENT
+# Dockerfile - FIXED VERSION
 FROM node:18-bookworm-slim
 
 # 1. Install system dependencies
@@ -11,25 +11,26 @@ RUN apt-get update && apt-get install -y \
     unzip \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. Create and activate virtual environment, install Vosk
-RUN python3 -m venv /opt/venv \
-    && /opt/venv/bin/pip install vosk
+# 2. Install Python Vosk
+RUN pip3 install vosk --break-system-packages
 
-# 3. Download Vosk model
+# 3. Download and extract the Vosk model to ROOT
 RUN curl -L https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip -o vosk-model.zip \
     && unzip -q vosk-model.zip \
-    && mv vosk-model-small-en-us-0.15 vosk-model \
+    && mv vosk-model-small-en-us-0.15 /vosk-model \
     && rm vosk-model.zip
 
-# 4. Set up Node.js app
+# 4. Create app directory FIRST
 WORKDIR /usr/src/app
-COPY package*.json ./
-RUN npm install --production
-COPY . .
 
-# 5. Make Python Vosk available system-wide
-ENV PATH="/opt/venv/bin:$PATH"
-ENV VIRTUAL_ENV="/opt/venv"
+# 5. Copy package files from build context
+COPY package*.json ./
+
+# 6. Install Node.js dependencies
+RUN npm install --omit=dev
+
+# 7. Copy the rest of the app
+COPY . .
 
 EXPOSE 10000
 CMD ["node", "server.js"]
