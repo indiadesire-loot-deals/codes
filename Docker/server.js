@@ -449,13 +449,13 @@ print(json.dumps({
       throw new Error(result.error);
     }
     
-    const transcript = result.text || "[No speech detected]";
+    const transcript = result.text || "";
     
-    if (transcript && transcript !== "[No speech detected]") {
+    if (transcript && transcript.trim() !== "") {
       console.log(`📝 Python Vosk Transcript: "${transcript}"`);
       
-      // Send to client
-      if (clientWs.readyState === WebSocket.OPEN) {
+      // Send to client ONLY if there's actual text
+      if (clientWs.readyState === WebSocket.OPEN && transcript.trim() !== "") {
         clientWs.send(JSON.stringify({
           type: 'transcript',
           userId: userId,
@@ -469,21 +469,8 @@ print(json.dumps({
       
       return transcript;
     } else {
-      console.log('⚠️ Empty or no-speech transcription received');
-      const fallbackText = `[Audio recorded: ${Math.round(audioBuffer.length / 16000)} seconds]`;
-      
-      if (clientWs.readyState === WebSocket.OPEN) {
-        clientWs.send(JSON.stringify({
-          type: 'transcript',
-          userId: userId,
-          recordingId: recordingId,
-          text: fallbackText,
-          timestamp: new Date().toISOString(),
-          engine: 'fallback'
-        }));
-      }
-      
-      return fallbackText;
+      console.log('⚠️ Empty or no-speech transcription received - NOT SENDING FALLBACK');
+      return null;
     }
     
   } catch (error) {
@@ -503,22 +490,11 @@ print(json.dumps({
       // Ignore cleanup errors
     }
     
-    // Send fallback transcript
-    const fallbackText = `[Audio recorded. Transcription service offline: ${error.message}]`;
-    if (clientWs.readyState === WebSocket.OPEN) {
-      clientWs.send(JSON.stringify({
-        type: 'transcript',
-        userId: userId,
-        recordingId: recordingId,
-        text: fallbackText,
-        timestamp: new Date().toISOString(),
-        engine: 'error-fallback'
-      }));
-    }
-    
-    return fallbackText;
+    console.log('❌ Transcription failed - NOT SENDING ERROR FALLBACK');
+    return null;
   }
 }
+    
 
 // ========== WEBSOCKET SERVER ==========
 
