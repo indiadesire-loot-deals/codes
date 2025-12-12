@@ -4,8 +4,13 @@ services:
     env: node
     region: oregon
     plan: free
-    buildCommand: npm install
-    startCommand: npm start
+    buildCommand: |
+      curl -L https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip -o vosk-model.zip
+      unzip -q vosk-model.zip
+      mv vosk-model-small-en-us-0.15 vosk-model
+      rm vosk-model.zip
+      npm install
+    startCommand: node server.js
     healthCheckPath: /health
     envVars:
       - key: NODE_ENV
